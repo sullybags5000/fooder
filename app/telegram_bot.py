@@ -1,7 +1,8 @@
-"""Telegram bot handlers. Works in both polling (dev) and webhook (prod) modes."""
+"""Telegram bot handlers."""
 import io
 import logging
 import uuid
+from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -15,64 +16,68 @@ from telegram.ext import (
 )
 
 from app.config import settings
-from app import db, fitbit, vision
+from app import db, sheets, vision
+from app.models import MealAnalysis
 
 log = logging.getLogger(__name__)
+
+
+def _authorized(update: Update) -> bool:
+    allowed = settings.allowed_user_ids
+    if not allowed:
+        return True  # open to everyone
+    return update.effective_user and update.effective_user.id in allowed
+
+
+async def _reject(update: Update) -> None:
+    await update.message.reply_text(
+        "🔒 This bot is private. Your Telegram ID is not on the allow-list."
+    )
 
 
 # --- Command handlers ---
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return await _reject(update)
     await update.message.reply_text(
         "👋 Welcome to Fooder.\n\n"
         "Send me a photo of your meal and I'll estimate the calories + macros "
-        "and log it to Fitbit.\n\n"
-        "First: /connect to link your Fitbit account.\n"
-        "Other commands: /status  /disconnect  /help"
+        "and log it to your Google Sheet.\n\n"
+        "Tip: add a caption with extra context, e.g. 'large portion with butter'.\n\n"
+        "Commands: /help  /ping"
     )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return await _reject(update)
     await update.message.reply_text(
         "How to use:\n"
-        "1. /connect — link Fitbit (one-time)\n"
-        "2. Send a photo (add a caption like 'large portion' for better accuracy)\n"
-        "3. Confirm the estimate → logged to Fitbit\n\n"
-        "/status — check Fitbit connection\n"
-        "/disconnect — remove Fitbit tokens"
+        "1. Send a photo of your meal (optionally with a caption)\n"
+        "2. Review the estimate\n"
+        "3. Tap *Log it* → a new row is appended to the spreadsheet\n\n"
+        "The sheet records timestamp, calories, macros, item breakdown, and your notes.",
+        parse_mode="Markdown",
     )
 
 
-async def cmd_connect(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not settings.fitbit_client_id:
-        await update.message.reply_text("⚠️ Fitbit not configured on the server.")
-        return
-    url = fitbit.build_auth_url(update.effective_chat.id)
-    await update.message.reply_text(
-        f"Connect Fitbit:\n{url}\n\nAfter approving, you'll be redirected and can come back here."
-    )
-
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    row = db.get_fitbit_tokens(update.effective_chat.id)
-    if row:
-        await update.message.reply_text("✅ Fitbit connected.")
-    else:
-        await update.message.reply_text("❌ Fitbit not connected. Run /connect")
-
-
-async def cmd_disconnect(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    db.delete_fitbit_tokens(update.effective_chat.id)
-    await update.message.reply_text("🔌 Fitbit disconnected.")
+async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return await _reject(update)
+    await update.message.reply_text("pong ✅")
 
 
 # --- Photo handler ---
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return await _reject(update)
+
     chat_id = update.effective_chat.id
+    user = update.effective_user
     caption = (update.message.caption or "").strip()
 
-    # Grab highest-resolution photo
     photo = update.message.photo[-1]
     file = await ctx.bot.get_file(photo.file_id)
     buf = io.BytesIO()
@@ -94,15 +99,18 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Stash for confirmation callback
     meal_id = uuid.uuid4().hex[:12]
-    db.save_pending_meal(meal_id, chat_id, analysis.model_dump())
+    db.save_pending_meal(
+        meal_id=meal_id,
+        chat_id=chat_id,
+        user_id=user.id,
+        username=user.username,
+        analysis=analysis.model_dump(),
+    )
 
     lines = [f"🍽 *{analysis.description}*", ""]
     for it in analysis.items:
-        lines.append(
-            f"• {it.name} ({it.portion}) — {int(it.calories)} kcal"
-        )
+        lines.append(f"• {it.name} ({it.portion}) — {int(it.calories)} kcal")
     lines += [
         "",
         f"Totals: *{int(analysis.total_calories)} kcal*  "
@@ -118,9 +126,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     ]])
 
     await thinking.edit_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        reply_markup=kb,
+        "\n".join(lines), parse_mode="Markdown", reply_markup=kb
     )
 
 
@@ -128,7 +134,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
     action, _, meal_id = q.data.partition(":")
-    chat_id = q.message.chat_id
 
     if action == "cancel":
         db.consume_pending_meal(meal_id)
@@ -136,29 +141,24 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if action == "log":
-        data = db.consume_pending_meal(meal_id)
-        if not data:
+        pending = db.consume_pending_meal(meal_id)
+        if not pending:
             await q.edit_message_text("⚠️ That meal expired. Send the photo again.")
             return
+        analysis = MealAnalysis.model_validate(pending["analysis"])
         try:
-            await fitbit.log_meal(
-                chat_id=chat_id,
-                name=data["description"],
-                calories=int(round(data["total_calories"])),
-                protein_g=data["total_protein_g"],
-                carbs_g=data["total_carbs_g"],
-                fat_g=data["total_fat_g"],
+            await sheets.log_meal(
+                user_id=pending["user_id"],
+                username=pending["username"],
+                analysis=analysis,
             )
-        except RuntimeError as e:
-            await q.edit_message_text(f"⚠️ {e}")
-            return
         except Exception as e:
-            log.exception("fitbit log failed")
-            await q.edit_message_text(f"⚠️ Fitbit error: {e}")
+            log.exception("sheets log failed")
+            await q.edit_message_text(f"⚠️ Sheets error: {e}")
             return
         await q.edit_message_text(
-            f"✅ Logged to Fitbit: {data['description']} — "
-            f"{int(data['total_calories'])} kcal"
+            f"✅ Logged to your sheet: {analysis.description} — "
+            f"{int(analysis.total_calories)} kcal"
         )
 
 
@@ -168,9 +168,7 @@ def build_application() -> Application:
     app = ApplicationBuilder().token(settings.telegram_bot_token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("connect", cmd_connect))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("disconnect", cmd_disconnect))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(CallbackQueryHandler(on_callback))
     return app

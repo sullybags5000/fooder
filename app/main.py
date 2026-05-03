@@ -15,11 +15,10 @@ import logging
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Header, HTTPException, Request
 from telegram import Update
 
-from app import db, fitbit
+from app import db
 from app.config import settings
 from app.telegram_bot import build_application
 
@@ -29,8 +28,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("fooder")
 
-
-# ---------- FastAPI lifespan & app ----------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -72,20 +69,6 @@ async def telegram_webhook(
     update = Update.de_json(await request.json(), tg.bot)
     await tg.process_update(update)
     return {"ok": True}
-
-
-@app.get("/fitbit/callback", response_class=HTMLResponse)
-async def fitbit_callback(code: str = Query(...), state: str = Query(...)):
-    try:
-        await fitbit.exchange_code(code, state)
-    except Exception as e:
-        log.exception("fitbit callback failed")
-        return HTMLResponse(
-            f"<h2>❌ Fitbit connection failed</h2><p>{e}</p>", status_code=400
-        )
-    return HTMLResponse(
-        "<h2>✅ Fitbit connected</h2><p>You can close this tab and return to Telegram.</p>"
-    )
 
 
 # ---------- Polling mode ----------
