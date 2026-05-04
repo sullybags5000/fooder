@@ -5,7 +5,8 @@ A/B providers without drift.
 """
 import base64
 import json
-from typing import Union
+import re
+from typing import Any, Union
 
 from app.config import settings
 from app.models import MealAnalysis
@@ -23,12 +24,135 @@ Return ONLY valid JSON matching the provided schema. No prose, no markdown.
 
 USER_INSTRUCTION = (
     "Analyze this meal photo. If the user provided a caption, treat it as "
-    "ground truth that overrides your visual guesses.\n\nUser caption: {caption}"
+    "ground truth that overrides your visual guesses.\n\n"
+    "Return STRICT JSON with EXACT keys:\n"
+    "{\n"
+    '  "description": "short one-line meal description",\n'
+    '  "items": [\n'
+    "    {\n"
+    '      "name": "food name",\n'
+    '      "portion": "estimated portion string",\n'
+    '      "calories": 0,\n'
+    '      "protein_g": 0,\n'
+    '      "carbs_g": 0,\n'
+    '      "fat_g": 0\n'
+    "    }\n"
+    "  ],\n"
+    '  "total_calories": 0,\n'
+    '  "total_protein_g": 0,\n'
+    '  "total_carbs_g": 0,\n'
+    '  "total_fat_g": 0,\n'
+    '  "confidence": 0.0,\n'
+    '  "notes": "optional caveats or null"\n'
+    "}\n"
+    "Do NOT use alternate keys like food_item or kcal_total.\n\n"
+    "User caption: {caption}"
 )
 
 
 def _build_user_prompt(caption: str) -> str:
-    return USER_INSTRUCTION.format(caption=caption or "(none)")
+    # Use plain string replacement so JSON braces in USER_INSTRUCTION are not
+    # interpreted as str.format placeholders.
+    return USER_INSTRUCTION.replace("{caption}", caption or "(none)")
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", value.replace(",", ""))
+        if m:
+            try:
+                return float(m.group(0))
+            except ValueError:
+                return default
+    return default
+
+
+def _normalize_meal_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize common LLM key drift into MealAnalysis schema."""
+    data = dict(payload or {})
+
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    norm_items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+
+        name = (
+            raw.get("name")
+            or raw.get("food_item")
+            or raw.get("food")
+            or raw.get("item")
+            or "unknown item"
+        )
+        portion = (
+            raw.get("portion")
+            or raw.get("serving")
+            or raw.get("amount")
+            or raw.get("quantity")
+            or "estimated portion"
+        )
+
+        calories = _to_float(raw.get("calories", raw.get("kcal", raw.get("energy_kcal", 0))))
+        protein_g = _to_float(raw.get("protein_g", raw.get("protein", 0)))
+        carbs_g = _to_float(raw.get("carbs_g", raw.get("carbs", raw.get("carbohydrates", 0))))
+        fat_g = _to_float(raw.get("fat_g", raw.get("fat", 0)))
+
+        norm_items.append(
+            {
+                "name": str(name),
+                "portion": str(portion),
+                "calories": calories,
+                "protein_g": protein_g,
+                "carbs_g": carbs_g,
+                "fat_g": fat_g,
+            }
+        )
+
+    data["items"] = norm_items
+
+    if not data.get("description"):
+        if norm_items:
+            top_names = ", ".join(it["name"] for it in norm_items[:3])
+            data["description"] = f"Meal with {top_names}"
+        else:
+            data["description"] = "No meal detected"
+
+    sum_cal = sum(_to_float(it.get("calories")) for it in norm_items)
+    sum_pro = sum(_to_float(it.get("protein_g")) for it in norm_items)
+    sum_carbs = sum(_to_float(it.get("carbs_g")) for it in norm_items)
+    sum_fat = sum(_to_float(it.get("fat_g")) for it in norm_items)
+
+    data["total_calories"] = _to_float(
+        data.get("total_calories", data.get("kcal_total", data.get("calories_total", sum_cal))),
+        default=sum_cal,
+    )
+    data["total_protein_g"] = _to_float(
+        data.get("total_protein_g", data.get("protein_total", sum_pro)),
+        default=sum_pro,
+    )
+    data["total_carbs_g"] = _to_float(
+        data.get("total_carbs_g", data.get("carbs_total", data.get("carbohydrates_total", sum_carbs))),
+        default=sum_carbs,
+    )
+    data["total_fat_g"] = _to_float(
+        data.get("total_fat_g", data.get("fat_total", sum_fat)),
+        default=sum_fat,
+    )
+
+    data["confidence"] = _to_float(data.get("confidence", 0.7), default=0.7)
+    data["confidence"] = max(0.0, min(1.0, data["confidence"]))
+
+    if "notes" not in data:
+        data["notes"] = None
+
+    return data
 
 
 async def analyze_meal(image_bytes: bytes, caption: str = "") -> MealAnalysis:
@@ -48,8 +172,6 @@ async def _analyze_gemini(image_bytes: bytes, caption: str) -> MealAnalysis:
 
     client = genai.Client(api_key=settings.gemini_api_key)
 
-    schema = MealAnalysis.model_json_schema()
-    # Gemini wants a response_schema, not a response_format
     response = await client.aio.models.generate_content(
         model=settings.gemini_model,
         contents=[
@@ -63,16 +185,26 @@ async def _analyze_gemini(image_bytes: bytes, caption: str) -> MealAnalysis:
         ],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
+            # NOTE: Do NOT pass response_schema here.
+            # google-genai==0.3.0 can fail converting nested Pydantic JSON schema
+            # ($defs/$ref + null union) into Gemini Schema.
+            # We request JSON output and validate ourselves with Pydantic.
             response_mime_type="application/json",
-            response_schema=MealAnalysis,
             temperature=0.2,
         ),
     )
-    # google-genai may return the parsed object directly
-    parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, MealAnalysis):
-        return parsed
-    return MealAnalysis.model_validate_json(response.text)
+
+    text = (response.text or "").strip()
+
+    # Defensive cleanup in case model returns fenced JSON despite instruction.
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+
+    payload = json.loads(text)
+    normalized = _normalize_meal_payload(payload)
+    return MealAnalysis.model_validate(normalized)
 
 
 # --- OpenAI ---
